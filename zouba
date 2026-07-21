@@ -1,0 +1,120 @@
+# backend/routes/webhook.py
+import os
+import hmac
+import hashlib
+import json
+from urllib.parse import parse_qs, unquote
+from pathlib import Path
+from dotenv import load_dotenv
+from fastapi import APIRouter, Request, HTTPException, Header
+
+env_path = Path(__file__).parent.parent / ".env"
+load_dotenv(env_path)
+
+router = APIRouter(tags=["webhook"])
+GITHUB_WEBHOOK_SECRET = os.getenv("GITHUB_WEBHOOK_SECRET", "")
+
+
+def verify_github_signature(payload: bytes, signature: str) -> bool:
+    """Verifies that the incoming payload signature matches our local Webhook Secret."""
+    if not GITHUB_WEBHOOK_SECRET:
+        return True  # Skip during local testing if secret is not populated
+
+    expected = "sha256=" + hmac.new(
+        GITHUB_WEBHOOK_SECRET.encode(),
+        payload,
+        hashlib.sha256
+    ).hexdigest()
+
+    return hmac.compare_digest(expected, signature)
+
+
+@router.post("/webhook")
+async def github_webhook(
+    request: Request,
+    x_hub_signature_256: str = Header(default=""),
+    x_github_event: str = Header(default=""),
+):
+    """Listens for GitHub webhook updates and registers analysis tasks to Celery."""
+    # ── 1. Read raw body safely ──
+    body = await request.body()
+
+    # Safeguard: Strip any invisible whitespaces/newlines from the raw bytes
+    if not body or not body.strip():
+        print("ℹ️ Received empty or whitespace-only request body. Skipping.")
+        return {"status": "ignored", "message": "Empty body received."}
+
+    # ── 2. Verify signature ──
+    if not verify_github_signature(body, x_hub_signature_256):
+        raise HTTPException(status_code=403, detail="Invalid signature")
+
+    # ── 3. Filter Event Type early ──
+    if x_github_event != "pull_request":
+        print(f"ℹ️ Received [{x_github_event.upper()}] event. Skipping analysis.")
+        return {"status": "ignored", "message": f"LogicHound only processes 'pull_request' events."}
+
+    # ── 4. Decode and Handle Content-Type Formats ──
+    raw_str = body.decode("utf-8").strip()
+    payload = {}
+
+    try:
+        # Scenario A: Payload is application/x-www-form-urlencoded
+        if raw_str.startswith("payload="):
+            parsed_form = parse_qs(raw_str)
+            raw_payload_json = parsed_form.get("payload", [None])[0]
+            if raw_payload_json:
+                payload = json.loads(raw_payload_json)
+            else:
+                raise ValueError("Form payload parameter was empty")
+        
+        # Scenario B: Payload is raw application/json
+        else:
+            payload = json.loads(raw_str)
+
+    except Exception as e:
+        print(f"❌ JSON Decode Error: {e}")
+        print(f"👉 Raw body received (first 120 chars): {repr(body[:120])}")
+        raise HTTPException(status_code=400, detail="Invalid JSON payload structure.")
+
+    action = payload.get("action")
+    if action not in ("opened", "synchronize"):
+        return {"status": "ignored", "message": f"Ignored PR action: {action}"}
+
+    # ── 5. Safely extract nested PR data ──
+    pr = payload.get("pull_request")
+    if not pr or not isinstance(pr, dict):
+        raise HTTPException(status_code=400, detail="Missing pull_request context.")
+
+    repo = payload.get("repository", {})
+    if not repo or not isinstance(repo, dict):
+        raise HTTPException(status_code=400, detail="Missing repository context.")
+
+    repo_url = repo.get("clone_url", "")
+    repo_full_name = repo.get("full_name", "")
+    pr_number = pr.get("number")
+    pr_branch = pr.get("head", {}).get("ref", "") if isinstance(pr.get("head"), dict) else ""
+    pr_title = pr.get("title", "")
+    pr_sha = pr.get("head", {}).get("sha", "") if isinstance(pr.get("head"), dict) else ""
+
+    if not repo_url or not pr_number:
+         raise HTTPException(status_code=400, detail="Missing critical pull request repository identifiers.")
+
+    # ── 6. Delegate scan execution to Celery ──
+    from worker import run_pr_analysis_task
+    task = run_pr_analysis_task.delay(
+        repo_url=repo_url,
+        repo_full_name=repo_full_name,
+        pr_number=pr_number,
+        pr_branch=pr_branch,
+        pr_title=pr_title,
+        pr_sha=pr_sha
+    )
+
+    print(f"🚀 Queued Celery Scan [{task.id}] for PR #{pr_number} on {repo_full_name}")
+
+    return {
+        "status": "queued",
+        "message": f"Scan queued for PR #{pr_number}",
+        "task_id": task.id,
+        "branch": pr_branch
+    }
